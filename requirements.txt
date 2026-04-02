@@ -1,4 +1,0 @@
-python-telegram-bot==21.5
-apscheduler==3.10.4
-aiohttp==3.9.5
-playwright==1.44.0
