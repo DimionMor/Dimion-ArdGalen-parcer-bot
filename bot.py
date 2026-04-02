@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для мониторинга kad.arbitr.ru по ИНН.
-Получает сессионные куки через первый запрос, затем делает API-запрос.
+Использует aiohttp с сессионными куками (как в botsudparser).
 Хостинг: Railway.
 """
 
@@ -9,10 +9,10 @@ import os
 import json
 import logging
 import asyncio
-import httpx
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -37,35 +37,42 @@ log = logging.getLogger(__name__)
 
 # ─── Запрос к kad.arbitr.ru ───────────────────────────────────────────────────
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
 async def fetch_cases(inn: str) -> list[dict]:
     """
-    1. Открываем главную страницу — получаем куки сессии
-    2. Делаем POST SearchInstances с этими куками
+    1. GET главной — получаем куки сессии (как в botsudparser)
+    2. POST SearchInstances с теми же куками
     """
-    headers_browser = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers=HEADERS,
+        timeout=aiohttp.ClientTimeout(total=60),
+    ) as session:
 
-    async with httpx.AsyncClient(
-        timeout=60,
-        follow_redirects=True,
-        headers=headers_browser,
-    ) as client:
-        # Шаг 1: получить куки с главной страницы
-        log.info("Получаю сессионные куки с kad.arbitr.ru...")
-        await client.get("https://kad.arbitr.ru/")
+        # Шаг 1: получить куки
+        log.info("Получаю сессию с kad.arbitr.ru...")
+        async with session.get(
+            "https://kad.arbitr.ru/",
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+        ) as resp:
+            await resp.read()
+            log.info("Главная: HTTP %d, куки: %s", resp.status, session.cookie_jar)
+
         await asyncio.sleep(2)
 
-        # Шаг 2: API-запрос с куками сессии
+        # Шаг 2: поисковый запрос
         log.info("Отправляю запрос по ИНН %s...", inn)
         payload = {
             "Page": 1,
@@ -81,24 +88,25 @@ async def fetch_cases(inn: str) -> list[dict]:
             "CaseType": "",
         }
 
-        resp = await client.post(
+        async with session.post(
             "https://kad.arbitr.ru/Kad/SearchInstances",
             json=payload,
             headers={
+                **HEADERS,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": "https://kad.arbitr.ru/",
                 "Origin": "https://kad.arbitr.ru",
             },
-        )
+        ) as resp:
+            log.info("SearchInstances: HTTP %d", resp.status)
+            text = await resp.text()
 
-        log.info("Ответ сервера: %d", resp.status_code)
+            if resp.status != 200:
+                raise Exception(f"HTTP {resp.status}: {text[:300]}")
 
-        if resp.status_code != 200:
-            raise Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
-
-        data = resp.json()
+            data = json.loads(text)
 
     if not data.get("Success"):
         log.warning("Success=false: %s", data.get("Message"))
@@ -166,8 +174,6 @@ async def check_and_notify(bot, notify: bool = True) -> str:
         )
 
     new_cases = [c for c in cases if c.get("CaseId") in new_ids]
-    log.info("Найдено новых дел: %d", len(new_cases))
-
     header = (
         f"📊 *Отчёт по ИНН* `{INN}`\n"
         f"🗓 {timestamp}\n\n"
@@ -222,7 +228,6 @@ async def start_http_server() -> None:
 
 async def post_init(application: Application) -> None:
     await start_http_server()
-
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         lambda: asyncio.ensure_future(check_and_notify(application.bot)),
