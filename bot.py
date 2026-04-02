@@ -71,32 +71,35 @@ async def fetch_cases(inn: str) -> list[dict]:
         title = await page.title()
         log.info("Заголовок: %s", title)
 
-        # Вводим ИНН в поле поиска
+        # Вводим ИНН в поле участника
         log.info("Ввожу ИНН в форму...")
         try:
-            # Ждём поле участника
+            # Поле "название, ИНН или ОГРН"
             inn_field = await page.wait_for_selector(
-                "input[placeholder*='участник'], input[placeholder*='ИНН'], "
-                "input[placeholder*='инн'], .js-participants-input, "
+                "input[placeholder*='название, ИНН'], "
+                "input[placeholder*='название'], "
+                "input[placeholder*='ИНН или ОГРН'], "
                 "#sug-participants",
                 timeout=15000,
             )
             await inn_field.click()
-            await inn_field.fill(inn)
+            await inn_field.triple_click()
+            await inn_field.type(inn, delay=50)
+            log.info("ИНН введён")
             await asyncio.sleep(1)
 
-            # Нажимаем кнопку Найти
+            # Кнопка Найти
             search_btn = await page.wait_for_selector(
-                "button.js-submit-search, button[type='submit'], "
-                ".b-form-submit, button:has-text('Найти')",
+                "button:has-text('Найти'), "
+                ".b-button-search, "
+                "input[value='Найти']",
                 timeout=10000,
             )
             await search_btn.click()
             log.info("Нажал Найти, жду результатов...")
 
         except PWTimeout as e:
-            log.error("Не нашёл элемент формы: %s", e)
-            # Пробуем кликнуть Найти напрямую
+            log.error("Не нашёл элемент: %s", e)
             await page.keyboard.press("Enter")
 
         # Ждём перехваченного ответа (макс 30 сек)
