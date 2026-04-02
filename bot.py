@@ -103,7 +103,7 @@ def format_case(case: dict) -> str:
 
 # ─── Проверка ─────────────────────────────────────────────────────────────────
 
-async def check_and_notify(bot) -> str:
+async def check_and_notify(bot, notify: bool = True) -> str:
     log.info("Запускаю проверку для ИНН %s", INN)
     try:
         cases = await fetch_cases(INN)
@@ -114,26 +114,32 @@ async def check_and_notify(bot) -> str:
     known   = load_state()
     current = {c.get("CaseId") for c in cases if c.get("CaseId")}
     new_ids = current - known
+    total   = len(current)
+    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     if not new_ids:
         log.info("Новых дел не обнаружено.")
         return (
-            f"✅ Новых дел для ИНН `{INN}` не найдено.\n"
-            f"_Проверено: {datetime.now().strftime('%d.%m.%Y %H:%M')}_"
+            f"📊 *Отчёт по ИНН* `{INN}`\n"
+            f"🗓 {timestamp}\n\n"
+            f"📁 Всего дел в базе: *{total}*\n"
+            f"✅ Новых дел нет"
         )
 
     new_cases = [c for c in cases if c.get("CaseId") in new_ids]
     log.info("Найдено новых дел: %d", len(new_cases))
 
     header = (
-        f"🔔 *Новые дела на kad.arbitr.ru*\n"
-        f"ИНН: `{INN}` | {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-        f"Найдено новых: *{len(new_cases)}*\n\n"
+        f"📊 *Отчёт по ИНН* `{INN}`\n"
+        f"🗓 {timestamp}\n\n"
+        f"📁 Всего дел в базе: *{total}*\n"
+        f"🔔 Обнаружено новых дел: *{len(new_cases)}*\n\n"
     )
     body = "\n\n".join(format_case(c) for c in new_cases)
     text = header + body
 
-    await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
+    if notify:
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
     save_state(known | new_ids)
     return text
 
@@ -152,11 +158,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔍 Запрашиваю данные, подождите...")
-    result = await check_and_notify(ctx.bot)
-    if update.effective_chat.id != CHAT_ID:
-        await update.message.reply_text(result, parse_mode="Markdown")
-    else:
-        await update.message.reply_text("✔️ Проверка завершена.", parse_mode="Markdown")
+    result = await check_and_notify(ctx.bot, notify=False)
+    await update.message.reply_text(result, parse_mode="Markdown")
 
 
 # ─── Keep-alive HTTP-сервер для Railway ───────────────────────────────────────
