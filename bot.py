@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для мониторинга kad.arbitr.ru по ИНН.
-Проверяет новые арбитражные дела раз в неделю.
-Хостинг: Railway (aiohttp keep-alive на $PORT).
+Использует Playwright для обхода защиты сайта.
+Хостинг: Railway.
 """
 
 import os
 import json
 import logging
 import asyncio
-import httpx
 from datetime import datetime
 from pathlib import Path
 
@@ -17,16 +16,16 @@ from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from playwright.async_api import async_playwright
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 
-BOT_TOKEN  = os.environ["BOT_TOKEN"]    # токен от @BotFather
-CHAT_ID    = int(os.environ["CHAT_ID"]) # ваш Telegram chat_id
+BOT_TOKEN  = os.environ["BOT_TOKEN"]
+CHAT_ID    = int(os.environ["CHAT_ID"])
 
-INN        = "7813322470"               # ИНН отслеживаемой организации
-STATE_FILE = Path("state.json")         # хранит ID уже известных дел
+INN        = "7813322470"
+STATE_FILE = Path("state.json")
 
-# Интервал проверки в часах (168 = 1 раз в неделю)
 CHECK_INTERVAL_HOURS = int(os.environ.get("CHECK_INTERVAL_HOURS", 168))
 
 logging.basicConfig(
@@ -36,39 +35,70 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Работа с kad.arbitr.ru ───────────────────────────────────────────────────
-
-KAD_URL = "https://kad.arbitr.ru/Kad/SearchInstances"
-
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 (compatible; KadMonitorBot/1.0)",
-    "Referer": "https://kad.arbitr.ru/",
-    "X-Requested-With": "XMLHttpRequest",
-}
-
+# ─── Парсинг через Playwright ─────────────────────────────────────────────────
 
 async def fetch_cases(inn: str) -> list[dict]:
-    """Запрашивает список дел по ИНН через API kad.arbitr.ru."""
-    payload = {
-        "Page": 1,
-        "Count": 50,
-        "Courts": [],
-        "DateFrom": None,
-        "DateTo": None,
-        "Sides": [{"Name": "", "Inn": inn, "Type": "participant"}],
-        "Judges": [],
-        "CaseNumbers": [],
-        "Keywords": "",
-        "CaseType": "",
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(KAD_URL, headers=HEADERS, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    return data.get("Result", {}).get("Items", [])
+    """
+    Открывает kad.arbitr.ru в headless-браузере, дожидается cookies,
+    затем делает API-запрос уже с правильной сессией.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"],
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        )
+        page = await context.new_page()
 
+        log.info("Открываю kad.arbitr.ru для получения сессии...")
+        await page.goto("https://kad.arbitr.ru/", wait_until="networkidle", timeout=60000)
+        await asyncio.sleep(3)  # ждём установки cookies защиты
+
+        log.info("Отправляю поисковый запрос по ИНН %s", inn)
+        payload = {
+            "Page": 1,
+            "Count": 50,
+            "Courts": [],
+            "DateFrom": None,
+            "DateTo": None,
+            "Sides": [{"Name": "", "Inn": inn, "Type": "participant"}],
+            "Judges": [],
+            "CaseNumbers": [],
+            "Keywords": "",
+            "WithVKSInstances": False,
+            "CaseType": "",
+        }
+
+        response = await page.evaluate(
+            """async (payload) => {
+                const resp = await fetch('/Kad/SearchInstances', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                    },
+                    body: JSON.stringify(payload),
+                });
+                return await resp.json();
+            }""",
+            payload,
+        )
+
+        await browser.close()
+
+    items = response.get("Result", {}).get("Items", []) if response.get("Success") else []
+    log.info("Получено дел: %d", len(items))
+    return items
+
+
+# ─── Состояние ────────────────────────────────────────────────────────────────
 
 def load_state() -> set:
     if STATE_FILE.exists():
@@ -108,7 +138,7 @@ async def check_and_notify(bot, notify: bool = True) -> str:
     try:
         cases = await fetch_cases(INN)
     except Exception as e:
-        log.error("Ошибка запроса к kad.arbitr.ru: %s", e)
+        log.error("Ошибка: %s", e)
         return f"⚠️ Ошибка при запросе к kad.arbitr.ru:\n`{e}`"
 
     known   = load_state()
@@ -162,13 +192,9 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(result, parse_mode="Markdown")
 
 
-# ─── Keep-alive HTTP-сервер для Railway ───────────────────────────────────────
+# ─── Keep-alive HTTP для Railway ──────────────────────────────────────────────
 
 async def start_http_server() -> None:
-    """
-    Railway требует открытый HTTP-порт — иначе считает деплой упавшим.
-    Поднимаем минимальный healthcheck-эндпоинт на $PORT.
-    """
     port = int(os.environ.get("PORT", 8080))
 
     async def healthcheck(request):
@@ -180,13 +206,12 @@ async def start_http_server() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    log.info("HTTP keep-alive запущен на порту %d", port)
+    log.info("HTTP keep-alive на порту %d", port)
 
 
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 
 async def post_init(application: Application) -> None:
-    """Запускается внутри event loop после инициализации бота."""
     await start_http_server()
 
     scheduler = AsyncIOScheduler()
