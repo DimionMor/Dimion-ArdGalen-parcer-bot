@@ -83,7 +83,7 @@ async def fetch_cases(inn: str) -> list[dict]:
                 timeout=15000,
             )
             await inn_field.click()
-            await inn_field.triple_click()
+            await inn_field.press("Control+a")
             await inn_field.type(inn, delay=50)
             log.info("ИНН введён")
             await asyncio.sleep(1)
