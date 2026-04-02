@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для мониторинга kad.arbitr.ru по ИНН.
-Использует Playwright для обхода защиты от ботов.
-Хостинг: Railway (Dockerfile).
+Playwright — заполняет форму поиска как человек.
 """
 
 import os
@@ -16,7 +15,7 @@ from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
 CHAT_ID    = int(os.environ["CHAT_ID"])
@@ -33,8 +32,7 @@ async def fetch_cases(inn: str) -> list[dict]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage"],
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
         context = await browser.new_context(
             user_agent=(
@@ -46,38 +44,71 @@ async def fetch_cases(inn: str) -> list[dict]:
         )
         page = await context.new_page()
 
+        # Перехватываем ответ SearchInstances
+        cases_result = []
+        search_done = asyncio.Event()
+
+        async def handle_response(response):
+            if "SearchInstances" in response.url:
+                try:
+                    data = await response.json()
+                    if data.get("Success"):
+                        cases_result.extend(
+                            data.get("Result", {}).get("Items", [])
+                        )
+                    log.info("Перехвачен SearchInstances: %d дел", len(cases_result))
+                except Exception as e:
+                    log.error("Ошибка парсинга ответа: %s", e)
+                finally:
+                    search_done.set()
+
+        page.on("response", handle_response)
+
         log.info("Открываю kad.arbitr.ru...")
         await page.goto("https://kad.arbitr.ru/", wait_until="networkidle", timeout=60000)
         await asyncio.sleep(3)
 
-        log.info("Отправляю запрос по ИНН %s...", inn)
-        payload = {
-            "Page": 1, "Count": 50,
-            "Courts": [], "DateFrom": None, "DateTo": None,
-            "Sides": [{"Name": "", "Inn": inn, "Type": "participant"}],
-            "Judges": [], "CaseNumbers": [],
-            "Keywords": "", "WithVKSInstances": False, "CaseType": "",
-        }
+        title = await page.title()
+        log.info("Заголовок: %s", title)
 
-        result = await page.evaluate("""async (payload) => {
-            const r = await fetch('/Kad/SearchInstances', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest',
-                },
-                body: JSON.stringify(payload),
-            });
-            return await r.json();
-        }""", payload)
+        # Вводим ИНН в поле поиска
+        log.info("Ввожу ИНН в форму...")
+        try:
+            # Ждём поле участника
+            inn_field = await page.wait_for_selector(
+                "input[placeholder*='участник'], input[placeholder*='ИНН'], "
+                "input[placeholder*='инн'], .js-participants-input, "
+                "#sug-participants",
+                timeout=15000,
+            )
+            await inn_field.click()
+            await inn_field.fill(inn)
+            await asyncio.sleep(1)
+
+            # Нажимаем кнопку Найти
+            search_btn = await page.wait_for_selector(
+                "button.js-submit-search, button[type='submit'], "
+                ".b-form-submit, button:has-text('Найти')",
+                timeout=10000,
+            )
+            await search_btn.click()
+            log.info("Нажал Найти, жду результатов...")
+
+        except PWTimeout as e:
+            log.error("Не нашёл элемент формы: %s", e)
+            # Пробуем кликнуть Найти напрямую
+            await page.keyboard.press("Enter")
+
+        # Ждём перехваченного ответа (макс 30 сек)
+        try:
+            await asyncio.wait_for(search_done.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            log.warning("Таймаут ожидания SearchInstances")
 
         await browser.close()
 
-    if not result.get("Success"):
-        log.warning("Success=false: %s", result.get("Message"))
-        return []
-    return result.get("Result", {}).get("Items", [])
+    log.info("Итого дел: %d", len(cases_result))
+    return cases_result
 
 
 def load_state() -> set:
