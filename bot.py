@@ -97,6 +97,7 @@ async def fetch_cases(inn: str) -> list[dict]:
             )
             await search_btn.click()
             log.info("Нажал Найти, жду результатов...")
+            await asyncio.sleep(2)
 
         except PWTimeout as e:
             log.error("Не нашёл элемент: %s", e)
