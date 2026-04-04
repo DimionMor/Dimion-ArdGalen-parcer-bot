@@ -85,7 +85,10 @@ async def fetch_cases(inn: str) -> list[dict]:
             await inn_field.click()
             await inn_field.press("Control+a")
             await inn_field.type(inn, delay=50)
-            log.info("ИНН введён")
+            log.info("ИНН введён, жду автодополнение...")
+            await asyncio.sleep(2)  # ждём выпадающий список
+            await inn_field.press("Enter")  # выбираем первый вариант
+            log.info("Enter нажат, выбран вариант из списка")
             await asyncio.sleep(1)
 
             # Кнопка Найти
