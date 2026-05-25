@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для мониторинга kad.arbitr.ru по ИНН.
-Playwright — заполняет форму поиска как человек.
+Playwright — регистрирует перехват ДО goto, кликает форму как человек.
 """
 
 import os
@@ -20,6 +20,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
 CHAT_ID    = int(os.environ["CHAT_ID"])
 INN        = "7813322470"
+COMPANY    = "АРД-ГАЛЕН"
 STATE_FILE = Path("state.json")
 CHECK_INTERVAL_HOURS = int(os.environ.get("CHECK_INTERVAL_HOURS", 168))
 
@@ -28,7 +29,7 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 
-async def fetch_cases(inn: str) -> list[dict]:
+async def fetch_cases() -> list[dict]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -44,79 +45,81 @@ async def fetch_cases(inn: str) -> list[dict]:
         )
         page = await context.new_page()
 
-        # Перехватываем ответ SearchInstances
+        # Регистрируем перехват ДО открытия страницы
         cases_result = []
         search_done = asyncio.Event()
 
-        async def handle_response(response):
+        async def on_response(response):
             if "SearchInstances" in response.url:
+                log.info("SearchInstances перехвачен! Статус: %d", response.status)
                 try:
                     data = await response.json()
+                    log.info("Success=%s, Items=%s", data.get("Success"),
+                             len(data.get("Result", {}).get("Items", [])) if data.get("Result") else 0)
                     if data.get("Success"):
-                        cases_result.extend(
-                            data.get("Result", {}).get("Items", [])
-                        )
-                    log.info("Перехвачен SearchInstances: %d дел", len(cases_result))
+                        items = data.get("Result", {}).get("Items", [])
+                        cases_result.extend(items)
                 except Exception as e:
-                    log.error("Ошибка парсинга ответа: %s", e)
+                    log.error("Ошибка парсинга: %s", e)
                 finally:
                     search_done.set()
 
-        page.on("response", handle_response)
+        page.on("response", on_response)
 
         log.info("Открываю kad.arbitr.ru...")
-        await page.goto("https://kad.arbitr.ru/", wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(3)
+        await page.goto("https://kad.arbitr.ru/", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(5)
+        log.info("Заголовок: %s", await page.title())
 
-        title = await page.title()
-        log.info("Заголовок: %s", title)
-
-        # Вводим ИНН в поле участника
-        log.info("Ввожу ИНН в форму...")
+        # Вводим название компании
         try:
-            # Поле "название, ИНН или ОГРН"
             inn_field = await page.wait_for_selector(
-                "input[placeholder*='название, ИНН'], "
-                "input[placeholder*='название'], "
-                "input[placeholder*='ИНН или ОГРН'], "
-                "#sug-participants",
+                "input[placeholder*='название']",
                 timeout=15000,
             )
             await inn_field.click()
-            await inn_field.press("Control+a")
-            await inn_field.type("АРД-ГАЛЕН", delay=100)
-            log.info("Название введено, жду автодополнение...")
-            await asyncio.sleep(3)  # ждём выпадающий список
-            await inn_field.press("ArrowDown")  # выбираем первый вариант
             await asyncio.sleep(0.5)
-            await inn_field.press("Enter")
-            log.info("Вариант выбран из списка")
+            await inn_field.type(COMPANY, delay=150)
+            log.info("Название введено: %s", COMPANY)
+            await asyncio.sleep(3)
+
+            # Кликаем первый вариант из выпадающего списка
+            suggestion = await page.query_selector(".tt-suggestion, li.tt-suggestion, .suggestions-item")
+            if suggestion:
+                await suggestion.click()
+                log.info("Кликнул на подсказку")
+            else:
+                # Логируем HTML выпадающего списка для диагностики
+                dropdown_html = await page.evaluate("""
+                    () => {
+                        const els = document.querySelectorAll('[class*="suggest"], [class*="dropdown"], [class*="autocomplete"], .tt-menu');
+                        return Array.from(els).map(e => e.outerHTML.substring(0, 200)).join('\\n---\\n');
+                    }
+                """)
+                log.info("Dropdown HTML: %s", dropdown_html[:500] if dropdown_html else "пусто")
+                await inn_field.press("ArrowDown")
+                await asyncio.sleep(0.3)
+                await inn_field.press("Enter")
+                log.info("Enter — выбрал через клавиатуру")
+
             await asyncio.sleep(1)
 
-            # Кнопка Найти
-            search_btn = await page.wait_for_selector(
-                "button:has-text('Найти'), "
-                ".b-button-search, "
-                "input[value='Найти']",
-                timeout=10000,
-            )
-            await search_btn.click()
-            log.info("Нажал Найти, жду результатов...")
-            await asyncio.sleep(2)
+            # Нажимаем Найти
+            await page.click("button:has-text('Найти')")
+            log.info("Нажал Найти")
 
-        except PWTimeout as e:
-            log.error("Не нашёл элемент: %s", e)
-            await page.keyboard.press("Enter")
+        except Exception as e:
+            log.error("Ошибка формы: %s", e)
 
-        # Ждём перехваченного ответа (макс 30 сек)
+        # Ждём SearchInstances
         try:
             await asyncio.wait_for(search_done.wait(), timeout=30)
+            log.info("Итого дел: %d", len(cases_result))
         except asyncio.TimeoutError:
-            log.warning("Таймаут ожидания SearchInstances")
+            log.warning("Таймаут — SearchInstances не перехвачен")
 
         await browser.close()
 
-    log.info("Итого дел: %d", len(cases_result))
     return cases_result
 
 
@@ -154,7 +157,7 @@ def format_case(case: dict) -> str:
 async def check_and_notify(bot, notify: bool = True) -> str:
     log.info("Проверка ИНН %s", INN)
     try:
-        cases = await fetch_cases(INN)
+        cases = await fetch_cases()
     except Exception as e:
         log.error("Ошибка: %s", e)
         return f"⚠️ Ошибка:\n`{e}`"
