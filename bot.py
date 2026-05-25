@@ -15,6 +15,7 @@ from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
@@ -215,11 +216,15 @@ async def start_http_server():
 
 async def post_init(application: Application):
     await start_http_server()
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=pytz.timezone("Europe/Moscow"))
     scheduler.add_job(
         lambda: asyncio.ensure_future(check_and_notify(application.bot)),
-        trigger="interval", hours=CHECK_INTERVAL_HOURS,
-        id="weekly_check", max_instances=1,
+        trigger="cron",
+        day_of_week="wed",
+        hour=12,
+        minute=0,
+        id="weekly_check",
+        max_instances=1,
     )
     scheduler.start()
     log.info("Бот запущен. ИНН: %s", INN)
